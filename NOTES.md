@@ -1,6 +1,6 @@
 # Group notes
 
-Group: g974 · Members: Jason QIU, Yannick ZHENG, Zhiqiang FANG, Mélodie VUONG · App: <https://github.com/AtzYuriste/Puff.git>
+Group: g974 · Members: Jason QIU, Yannick ZHENG, Zhiqiang FANG, Mélodie VUONG · App: <https://github.com/traefik/whoami.git>
 
 Write every decision here with one line of why. It becomes your defense pitch.
 
@@ -18,3 +18,9 @@ Write every decision here with one line of why. It becomes your defense pitch.
 ## M1, compute + data
 
 - check output:
+  - PASS M1 app image in ECR
+    PASS M1 ECS service running (1 task)
+    PASS M1 ALB answers 200
+    PASS M1 RDS Postgres available
+    PASS M1 S3 status page online
+    PASS M1 infra/deploy.sh committed
