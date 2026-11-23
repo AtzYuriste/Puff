@@ -74,7 +74,7 @@ aws ecs create-service --cluster $GROUP --service-name $GROUP-app \
 
 aws rds create-db-instance --db-instance-identifier $GROUP-db \
   --engine postgres --db-instance-class db.t3.micro --allocated-storage 20 \
-  --master-username app --master-user-password 'ChangeMe-123' \
+  --master-username app --master-user-password "$(aws secretsmanager get-secret-value --secret-id $GROUP/db-password --query SecretString --output text)" \
   --publicly-accessible
 
 aws rds describe-db-instances --db-instance-identifier $GROUP-db \
@@ -191,7 +191,7 @@ aws rds create-db-subnet-group --db-subnet-group-name $GROUP-db-subnets \
 # The v2 database: private subnets, database firewall, not public
 aws rds create-db-instance --db-instance-identifier $GROUP-db2 \
   --engine postgres --db-instance-class db.t3.micro --allocated-storage 20 \
-  --master-username app --master-user-password 'ChangeMe-123' \
+  --master-username app --master-user-password "$(aws secretsmanager get-secret-value --secret-id $GROUP/db-password --query SecretString --output text)" \
   --db-subnet-group-name $GROUP-db-subnets --vpc-security-group-ids $DB_SG2 \
   --no-publicly-accessible
 
@@ -209,3 +209,121 @@ aws elbv2 delete-target-group --target-group-arn $(aws elbv2 describe-target-gro
 
 # Delete the public database
 aws rds delete-db-instance --db-instance-identifier $GROUP-db --skip-final-snapshot
+
+# M3: Secret
+
+# Step 1
+
+# A random 24-character password, stored in Secrets Manager
+aws secretsmanager create-secret --name $GROUP/db-password \
+  --secret-string "$(aws secretsmanager get-random-password --password-length 24 \
+    --exclude-punctuation --query RandomPassword --output text)"
+
+# Its ARN, the address your app will use to ask for it
+SECRET_ARN=$(aws secretsmanager describe-secret --secret-id $GROUP/db-password --query ARN --output text)
+
+# Rotate: the database now uses the new password, the old one is dead
+aws rds modify-db-instance --db-instance-identifier $GROUP-db2 --apply-immediately \
+  --master-user-password "$(aws secretsmanager get-secret-value --secret-id $GROUP/db-password \
+    --query SecretString --output text)"
+
+# Step 2
+
+# Who may use the role: ECS tasks
+aws iam create-role --role-name $GROUP-exec-role --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+}'
+
+# What the role may do: read your secret, write logs
+aws iam put-role-policy --role-name $GROUP-exec-role --policy-name read-secret-write-logs --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": \"secretsmanager:GetSecretValue\", \"Resource\": \"$SECRET_ARN\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\"], \"Resource\": \"*\"}
+  ]
+}"
+
+# Keep its ARN for the next step
+EXEC_ROLE=$(aws iam get-role --role-name $GROUP-exec-role --query Role.Arn --output text)
+
+# Step 3
+
+# A place for the logs
+aws logs create-log-group --log-group-name /ecs/$GROUP-app
+
+# The database address, passed as plain config (it's not a secret)
+read DB_HOST DB_PORT < <(aws rds describe-db-instances --db-instance-identifier $GROUP-db2 \
+  --query 'DBInstances[0].Endpoint.[Address,Port]' --output text)
+
+# Revision 2 of the task: secrets by reference, logs to CloudWatch
+aws ecs register-task-definition --family $GROUP-app \
+  --network-mode awsvpc --requires-compatibilities FARGATE --cpu 256 --memory 512 \
+  --execution-role-arn $EXEC_ROLE \
+  --container-definitions "[{
+    \"name\": \"app\", \"image\": \"$REGISTRY/$GROUP-app:v1\", \"essential\": true,
+    \"portMappings\": [{\"containerPort\": 80}],
+    \"environment\": [{\"name\": \"DB_HOST\", \"value\": \"$DB_HOST\"}, {\"name\": \"DB_PORT\", \"value\": \"$DB_PORT\"}],
+    \"secrets\": [{\"name\": \"DB_PASSWORD\", \"valueFrom\": \"$SECRET_ARN\"}],
+    \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {
+      \"awslogs-group\": \"/ecs/$GROUP-app\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"app\"}}
+  }]"
+
+# Roll the service to the new revision
+aws ecs update-service --cluster $GROUP --service $GROUP-app2 --task-definition $GROUP-app
+
+# Step 4
+
+# A topic: the alarm's loudspeaker
+TOPIC=$(aws sns create-topic --name $GROUP-alerts --query TopicArn --output text)
+
+# Your pager: a queue subscribed to the topic
+PAGER=$(aws sqs create-queue --queue-name $GROUP-pager --query QueueUrl --output text)
+PAGER_ARN=$(aws sqs get-queue-attributes --queue-url $PAGER --attribute-names QueueArn \
+  --query Attributes.QueueArn --output text)
+aws sns subscribe --topic-arn $TOPIC --protocol sqs --notification-endpoint $PAGER_ARN
+
+# The alarm: 1 error or more in a minute pages you
+aws cloudwatch put-metric-alarm --alarm-name $GROUP-errors \
+  --namespace $GROUP --metric-name Errors --statistic Sum --period 60 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold --alarm-actions $TOPIC
+
+# Simulate your app reporting 3 errors
+aws cloudwatch put-metric-data --namespace $GROUP --metric-name Errors --value 3
+
+# Within a minute, read your pager and keep the page in NOTES.md
+aws sqs receive-message --queue-url $PAGER --query 'Messages[0].Body' --output text
+
+# Step 5
+
+# Who may become the deployer: people of this account
+aws iam create-role --role-name $GROUP-deployer --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"}, "Action": "sts:AssumeRole"}]
+}'
+
+# What the deployer may do: update your service, register task versions, read logs, nothing else
+aws iam put-role-policy --role-name $GROUP-deployer --policy-name deploy-only --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:DescribeServices\", \"ecs:UpdateService\"],
+     \"Resource\": \"arn:aws:ecs:us-east-1:000000000000:service/$GROUP/$GROUP-app2\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:RegisterTaskDefinition\", \"ecs:DescribeTaskDefinition\",
+     \"logs:GetLogEvents\", \"logs:FilterLogEvents\", \"logs:DescribeLogStreams\"], \"Resource\": \"*\"},
+    {\"Effect\": \"Allow\", \"Action\": \"iam:PassRole\", \"Resource\": \"$EXEC_ROLE\"}
+  ]
+}"
+
+# Become the deployer for this terminal: temporary credentials, valid one hour
+read DK DS DT < <(aws sts assume-role --role-arn arn:aws:iam::000000000000:role/$GROUP-deployer \
+  --role-session-name $USER --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$DK AWS_SECRET_ACCESS_KEY=$DS AWS_SESSION_TOKEN=$DT
+aws sts get-caller-identity
+
+# Allowed: scale your service
+aws ecs update-service --cluster $GROUP --service $GROUP-app2 --desired-count 1 --query service.desiredCount
+
+aws rds delete-db-instance --db-instance-identifier $GROUP-db2 --skip-final-snapshot 2>&1
+
+# Back to your admin keys
+unset AWS_SESSION_TOKEN && source env.sh
