@@ -5,3 +5,5 @@ app-src/
 index.html
 vm.sh
 .vscode/
+scaler.py
+scaler.zip
