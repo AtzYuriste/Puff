@@ -76,3 +76,33 @@ PASS M3 deployer role without wildcard actions
 PASS M3 deployer AccessDenied proof saved in NOTES.md
 PASS M3 no password left in your current scripts
 ```
+
+## M4
+
+```
+2026-11-24T15:40:17.882000+00:00 2026/11/24/[$LATEST]e0baf62a g974-app2: 2 -> 3
+2026-11-24T15:41:06.818000+00:00 2026/11/24/[$LATEST]e0baf62a g974-app2: 3 -> 2
+```
+
+## Idea
+
+- Problem: everybody submits between 23:20 and 23:42, and scaling on load reacts after the rush has started.
+- Pick: an EventBridge Scheduler schedule calls our scaler at 23:20 with {"desired": 4}, so the containers are ready before the rush.
+- Rejected: only the load alarm, because it scales one container per minute after the load is already high.
+
+---
+
+- check output:
+
+```
+PASS M4 at least 2 containers running (2)
+PASS M4 the service spans 2 Availability Zones
+PASS M4 the load balancer answers 200
+PASS M4 your autoscaler function exists
+PASS M4 its role can scale your service only
+PASS M4 an alarm calls your autoscaler
+PASS M4 your autoscaler scaled out
+PASS M4 your autoscaler scaled back in
+PASS M4 CloudFront serves your status page
+PASS M4 your idea is designed in NOTES.md
+```

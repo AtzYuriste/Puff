@@ -327,3 +327,115 @@ aws rds delete-db-instance --db-instance-identifier $GROUP-db2 --skip-final-snap
 
 # Back to your admin keys
 unset AWS_SESSION_TOKEN && source env.sh
+
+# M4
+
+# Step 1
+
+# Two copies of your app, ECS spreads them over your two subnets
+aws ecs update-service --cluster $GROUP --service $GROUP-app2 --desired-count 2
+
+# Your load balancer's address
+ALB_DNS=$(aws elbv2 describe-load-balancers --names $GROUP-alb2 \
+  --query 'LoadBalancers[0].DNSName' --output text)
+
+# 30 seconds later: 8 requests, count who answered (whoami prints its Hostname)
+for i in $(seq 1 8); do curl -s http://$ALB_DNS/ | grep Hostname; done | sort | uniq -c
+
+# Step 2
+
+# Pick one running container
+TASK=$(aws ecs list-tasks --cluster $GROUP --service-name $GROUP-app2 --query 'taskArns[0]' --output text)
+
+# Kill it (on Floci a container is a Docker container on your machine)
+docker rm -f floci-aws-ecs-${TASK##*/}-app
+
+# Meanwhile, hit your site every 3 seconds: you want 200s all along
+for i in $(seq 1 10); do curl -s -o /dev/null -w '%{http_code} ' http://$ALB_DNS/; sleep 3; done; echo
+
+# ECS noticed and started a replacement
+aws ecs describe-services --cluster $GROUP --services $GROUP-app2 --query 'services[0].[desiredCount,runningCount]'
+
+# Step 3
+
+cat > scaler.py <<'PY'
+import json, os
+import boto3
+
+ecs = boto3.client("ecs")
+
+def handler(event, context):
+    cluster, service = os.environ["CLUSTER"], os.environ["SERVICE"]
+    low, high = int(os.environ["MIN"]), int(os.environ["MAX"])
+    now = ecs.describe_services(cluster=cluster, services=[service])["services"][0]["desiredCount"]
+    if "Records" in event:                       # an alarm, through SNS
+        state = json.loads(event["Records"][0]["Sns"]["Message"])["NewStateValue"]
+        want = now + 1 if state == "ALARM" else now - 1
+    else:                                        # a direct call or a schedule: {"desired": 4}
+        want = int(event["desired"])
+    want = max(low, min(high, want))
+    ecs.update_service(cluster=cluster, service=service, desiredCount=want)
+    print(f"{service}: {now} -> {want}")
+    return {"from": now, "to": want}
+PY
+
+# Zip it (Python's own zip, works everywhere)
+python3 -m zipfile -c scaler.zip scaler.py
+
+# Who may use the role: Lambda, and the scheduler (for the midnight deadline)
+aws iam create-role --role-name $GROUP-scaler-role --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"Service": ["lambda.amazonaws.com", "scheduler.amazonaws.com"]}, "Action": "sts:AssumeRole"}]
+}'
+
+# What it may do: read and update your service, write its logs, be invoked
+aws iam put-role-policy --role-name $GROUP-scaler-role --policy-name scale-one-service --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:DescribeServices\", \"ecs:UpdateService\"],
+     \"Resource\": \"arn:aws:ecs:us-east-1:000000000000:service/$GROUP/$GROUP-app2\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\", \"lambda:InvokeFunction\"],
+     \"Resource\": \"*\"}
+  ]
+}"
+SCALER_ROLE=$(aws iam get-role --role-name $GROUP-scaler-role --query Role.Arn --output text)
+
+# Create the function: between 2 and 4 copies
+SCALER=$(aws lambda create-function --function-name $GROUP-scaler \
+  --runtime python3.12 --handler scaler.handler --zip-file fileb://scaler.zip --role $SCALER_ROLE \
+  --environment "Variables={CLUSTER=$GROUP,SERVICE=$GROUP-app2,MIN=2,MAX=4}" \
+  --query FunctionArn --output text)
+
+# A topic between the alarm and the function, and the right for SNS to call it
+SCALE_TOPIC=$(aws sns create-topic --name $GROUP-scale --query TopicArn --output text)
+aws sns subscribe --topic-arn $SCALE_TOPIC --protocol lambda --notification-endpoint $SCALER
+aws lambda add-permission --function-name $GROUP-scaler --statement-id from-sns \
+  --action lambda:InvokeFunction --principal sns.amazonaws.com --source-arn $SCALE_TOPIC
+
+# The alarm: load above 70 calls the topic, and back to OK calls it too (to scale in)
+aws cloudwatch put-metric-alarm --alarm-name $GROUP-load-high \
+  --namespace $GROUP --metric-name Load --statistic Average --period 60 --evaluation-periods 1 \
+  --threshold 70 --comparison-operator GreaterThanThreshold \
+  --alarm-actions $SCALE_TOPIC --ok-actions $SCALE_TOPIC
+
+# Step 4
+
+# A crowd arrives: load 95
+aws cloudwatch put-metric-data --namespace $GROUP --metric-name Load --value 95
+
+# Within a minute: 3 copies, and the function's own log says why
+aws ecs describe-services --cluster $GROUP --services $GROUP-app2 --query 'services[0].desiredCount'
+aws logs tail /aws/lambda/$GROUP-scaler --since 10m
+
+# The crowd leaves: load 10, back to 2 within a minute
+aws cloudwatch put-metric-data --namespace $GROUP --metric-name Load --value 10
+aws ecs describe-services --cluster $GROUP --services $GROUP-app2 --query 'services[0].desiredCount'
+
+# Step 5
+
+read CF_ID CF_DOMAIN < <(aws cloudfront create-distribution \
+  --origin-domain-name $GROUP-site.s3.amazonaws.com --default-root-object index.html \
+  --query 'Distribution.[Id,DomainName]' --output text)
+
+# On real AWS: https://$CF_DOMAIN. On Floci it answers here:
+curl http://$CF_ID.cloudfront.localhost.floci.io:4566/
