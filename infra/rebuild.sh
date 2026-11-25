@@ -58,4 +58,22 @@ aws s3api delete-public-access-block --bucket $GROUP-site
 aws s3api put-bucket-policy --bucket $GROUP-site --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$GROUP-site/*\"}]}"
 aws cloudfront create-distribution --origin-domain-name $GROUP-site.s3.amazonaws.com --default-root-object index.html >/dev/null
 
+SCALER_ROLE=arn:aws:iam::000000000000:role/$GROUP-scaler-role
+cat > prewarm.json <<EOF
+{"Arn": "$SCALER", "RoleArn": "$SCALER_ROLE", "Input": "{\"desired\": 4}"}
+EOF
+aws scheduler create-schedule --name $GROUP-prewarm \
+  --schedule-expression-timezone Europe/Paris \
+  --schedule-expression "at(2026-11-25T23:20:00)" --flexible-time-window Mode=OFF \
+  --target file://prewarm.json
+
+cat > postdeadline.json <<EOF
+{"Arn": "$SCALER", "RoleArn": "$SCALER_ROLE", "Input": "{\"desired\": 2}"}
+EOF
+aws scheduler create-schedule --name $GROUP-postdeadline  \
+  --schedule-expression-timezone Europe/Paris \
+  --schedule-expression "at(2026-11-25T23:50:00)" --flexible-time-window Mode=OFF \
+  --target file://postdeadline.json
+
+
 echo "Rebuilt in $(( $(date +%s) - START )) s. App: http://$(out $GROUP-app AlbDns)/"

@@ -439,3 +439,5 @@ read CF_ID CF_DOMAIN < <(aws cloudfront create-distribution \
 
 # On real AWS: https://$CF_DOMAIN. On Floci it answers here:
 curl http://$CF_ID.cloudfront.localhost.floci.io:4566/
+
+# M5: cloudformation

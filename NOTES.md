@@ -89,6 +89,7 @@ PASS M3 no password left in your current scripts
 - Problem: everybody submits between 23:20 and 23:42, and scaling on load reacts after the rush has started.
 - Pick: an EventBridge Scheduler schedule calls our scaler at 23:20 with {"desired": 4}, so the containers are ready before the rush.
 - Rejected: only the load alarm, because it scales one container per minute after the load is already high.
+- Built: two EventBridge Scheduler schedules in infra/rebuild.sh, g974-prewarm (23:20 Paris, desired 4) and g974-postdeadline (23:50 Paris, desired 2), both calling the g974-scaler Lambda through g974-scaler-role.
 
 ---
 
